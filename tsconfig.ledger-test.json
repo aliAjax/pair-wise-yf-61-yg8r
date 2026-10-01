@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "ES2022",
+    "outDir": "out-tsc/ledger-test",
+    "types": [],
+    "importHelpers": false
+  },
+  "include": [
+    "src/app/state/release.models.ts",
+    "src/app/state/release.ledger.ts",
+    "src/app/state/release.storage.ts",
+    "src/app/state/release.ledger.spec.ts",
+    "src/test-shims.d.ts"
+  ]
+}

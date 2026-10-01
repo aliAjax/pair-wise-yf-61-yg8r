@@ -6,6 +6,7 @@
     "dev": "ng serve --host 0.0.0.0 --port 62026",
     "start": "ng serve --host 0.0.0.0 --port 62026",
     "build": "ng build",
+    "test:ledger": "tsc -p tsconfig.ledger-test.json && node --test out-tsc/ledger-test/release.ledger.spec.js",
     "preview": "ng serve --host 0.0.0.0 --port 62026"
   },
   "dependencies": {

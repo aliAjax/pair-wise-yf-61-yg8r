@@ -1,46 +1,132 @@
 import { createReducer, on } from '@ngrx/store';
-import type { AuditEntry, DeviceGroup, ReleaseBatch, ReleaseState } from './release.models';
-import { approveBatch, createBatch, pauseBatch, resumeBatch, rollbackBatch, telemetryTick } from './release.actions';
+import type { ReleaseState, TelemetryReceipt } from './release.models';
+import {
+  changeBatchVersion,
+  createBatch as createBatchLedger,
+  faultAwareStore,
+  ledgerCounters,
+  pauseBatch as pauseBatchLedger,
+  resumeBatch as resumeBatchLedger,
+  retryPendingReceipts,
+  rollbackBatch as rollbackBatchLedger,
+  startBatch as startBatchLedger,
+  submitReceipts as submitReceiptsLedger,
+  withAudit
+} from './release.ledger';
+import {
+  changeVersion,
+  configureStorageFault,
+  createBatch,
+  dismissReceiptResult,
+  pauseBatch,
+  resumeBatch,
+  retryPendingReceipts as retryPendingReceiptsAction,
+  rollbackBatch,
+  startBatch,
+  submitReceipts,
+  telemetryTick
+} from './release.actions';
+import { loadInitialState, STORAGE_KEY_V2 } from './release.storage';
 
-const initialGroups: DeviceGroup[] = [
-  { id: 'g-edge', name: '华东边缘网关', region: '华东', count: 680, compatible: true, offlineGateways: 4 },
-  { id: 'g-plant', name: '工业采集终端', region: '华南', count: 1240, compatible: false, offlineGateways: 12 },
-  { id: 'g-clinic', name: '远程诊疗终端', region: '新加坡', count: 310, compatible: true, offlineGateways: 2 }
-];
-const now = new Date().toISOString();
-const initialBatches: ReleaseBatch[] = [
-  { id: 'batch-demo', name: '边缘网关安全补丁 2.8.1', firmware: '2.8.1', rollbackVersion: '2.7.9', groupId: 'g-edge', rolloutPercent: 20, failureThreshold: 5, status: 'approved', progress: 0, downloaded: 0, failed: 0, updatedAt: now }
-];
-const initialAudits: AuditEntry[] = [{ id: 'audit-1', at: now, actor: '运维值班', message: '批次 batch-demo 完成兼容性检查并进入已审批' }];
-const STORAGE_KEY = 'firmware-release-v1';
-const fallback: ReleaseState = { groups: initialGroups, batches: initialBatches, audits: initialAudits };
-const stored = typeof localStorage === 'undefined' ? fallback : JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null') as ReleaseState | null;
-const initialState = stored ?? fallback;
+const initialState = loadInitialState();
 
-function audit(state: ReleaseState, actor: string, message: string): AuditEntry[] {
-  return [{ id: crypto.randomUUID(), at: new Date().toISOString(), actor, message }, ...state.audits];
+/**
+ * 遥测模拟：为每个运行中批次挑选下一台未重启的目标设备，推进一个阶段，
+ * 偶发重发同一条回执（验证去重）。所有模拟数据都走提交链路，不直接改账。
+ */
+function simulateTick(state: ReleaseState): ReleaseState {
+  let next = state;
+  const store = faultAwareStore(state.storageFault);
+  // 遥测模拟不覆盖值班员人工提交的结果卡片。
+  const humanResult = state.lastReceiptResult;
+  for (const batch of state.batches.filter((item) => item.status === 'running')) {
+    const counters = ledgerCounters(batch);
+    if (counters.rebooted >= counters.target) continue;
+    // 约 8% 概率注入一台设备失败，供失败阈值自动暂停使用。
+    if (Math.random() < 0.08 && batch.failed < counters.target) {
+      const at = new Date().toISOString();
+      next = {
+        ...next,
+        batches: next.batches.map((item) => item.id === batch.id ? { ...item, failed: item.failed + 1, updatedAt: at, revision: item.revision + 1 } : item),
+        audits: withAudit(next, { now: () => at, uuid: () => `tel-fail-${Math.random().toString(36).slice(2)}` }, '遥测模拟器', `批次 ${batch.name} 一台设备上报失败，累计 ${batch.failed + 1} 台`)
+      };
+    }
+    const device = batch.deviceIds.find((id) => {
+      const entry = batch.ledger.find((item) => item.deviceId === id);
+      return !entry || entry.stage !== 'rebooted';
+    });
+    if (!device) continue;
+    const entry = batch.ledger.find((item) => item.deviceId === device);
+    const nextStage = !entry ? 'downloaded' : entry.stage === 'downloaded' ? 'installed' : 'rebooted';
+    const already = entry?.stages.find((event) => event.stage === nextStage);
+    const id = already?.receiptId ?? `tel-${batch.id}-${device}-${nextStage}`;
+    const receipt: TelemetryReceipt = {
+      id,
+      batchId: batch.id,
+      deviceId: device,
+      stage: nextStage,
+      firmwareVersion: batch.firmwareVersion,
+      at: new Date().toISOString()
+    };
+    const simClock = () => ({ now: () => new Date().toISOString(), uuid: () => `tel-audit-${Math.random().toString(36).slice(2)}` });
+    const latest = next.batches.find((item) => item.id === batch.id) ?? batch;
+    next = submitReceiptsLedger(next, { batchId: batch.id, receipts: [receipt], baseRevision: latest.revision, actor: '遥测模拟器', store, silent: true }, simClock());
+    // 约 15% 概率重发刚送达的同号回执，验证重复回执只出现一次。
+    if (Math.random() < 0.15) {
+      const replayed = next.batches.find((item) => item.id === batch.id) ?? latest;
+      next = submitReceiptsLedger(next, { batchId: batch.id, receipts: [receipt], baseRevision: replayed.revision, actor: '遥测模拟器(重发)', store, silent: true }, simClock());
+    }
+  }
+  if (humanResult !== next.lastReceiptResult) next = { ...next, lastReceiptResult: humanResult };
+  return next;
+}
+
+/** 失败率自动暂停：按当前版本设备账重算，不依赖历史计数。 */
+function applyFailureGuard(state: ReleaseState, before: ReleaseState): ReleaseState {
+  for (const batch of state.batches) {
+    if (batch.status !== 'running') continue;
+    const previous = before.batches.find((item) => item.id === batch.id);
+    if (previous?.status !== 'running') continue;
+    const counters = ledgerCounters(batch);
+    if (counters.downloaded === 0) continue;
+    const rate = batch.failed / counters.downloaded * 100;
+    if (rate > batch.failureThreshold) {
+      const at = new Date().toISOString();
+      state = {
+        ...state,
+        batches: state.batches.map((item) => item.id === batch.id ? { ...item, status: 'paused', updatedAt: at, revision: item.revision + 1 } : item),
+        audits: withAudit(state, { now: () => at, uuid: () => `guard-${Math.random().toString(36).slice(2)}` }, '系统', `批次 ${batch.name} 失败率 ${rate.toFixed(1)}% 超过阈值 ${batch.failureThreshold}%，已自动暂停`)
+      };
+    }
+  }
+  return state;
+}
+
+function persist(state: ReleaseState): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(state));
+  } catch {
+    // 单次写入失败不影响内存账，下个 tick 会重试整体持久化。
+  }
 }
 
 export const releaseReducer = createReducer(
   initialState,
-  on(createBatch, (state, { batch }) => ({ ...state, batches: [batch, ...state.batches], audits: audit(state, '发布负责人', `创建批次 ${batch.name}`) })),
-  on(approveBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'approved', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 审批通过`) })),
-  on(pauseBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'paused', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 已暂停`) })),
-  on(resumeBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'running', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 恢复发布`) })),
-  on(rollbackBatch, (state, { id, actor }) => ({ ...state, batches: state.batches.map((batch) => batch.id === id ? { ...batch, status: 'rolled_back', updatedAt: new Date().toISOString() } : batch), audits: audit(state, actor, `批次 ${id} 已紧急回滚`) })),
+  on(createBatch, (state, props) => createBatchLedger(state, props)),
+  on(startBatch, (state, { id, actor }) => startBatchLedger(state, id, actor)),
+  on(pauseBatch, (state, { id, actor }) => pauseBatchLedger(state, id, actor)),
+  on(resumeBatch, (state, { id, actor }) => resumeBatchLedger(state, id, actor)),
+  on(rollbackBatch, (state, { id, actor }) => rollbackBatchLedger(state, id, actor)),
+  on(changeVersion, (state, { id, firmwareVersion, actor }) => changeBatchVersion(state, id, firmwareVersion, actor)),
+  on(submitReceipts, (state, props) => submitReceiptsLedger(state, { ...props, store: faultAwareStore(state.storageFault) })),
+  on(retryPendingReceiptsAction, (state, { id, actor }) => retryPendingReceipts(state, id, actor ?? '值班员', faultAwareStore(state.storageFault))),
+  on(configureStorageFault, (state, { fault }) => ({ ...state, storageFault: fault })),
+  on(dismissReceiptResult, (state) => ({ ...state, lastReceiptResult: null })),
   on(telemetryTick, (state) => {
-    const batches = state.batches.map((batch) => {
-      if (batch.status !== 'running') return batch;
-      const group = state.groups.find((item) => item.id === batch.groupId);
-      const target = Math.round((group?.count ?? 0) * batch.rolloutPercent / 100);
-      const increment = Math.max(4, Math.round(target * 0.055));
-      const downloaded = Math.min(target, batch.downloaded + increment);
-      const failed = batch.failed + (Math.random() < 0.08 ? 1 : 0);
-      const failureRate = downloaded ? failed / downloaded * 100 : 0;
-      const status: ReleaseBatch['status'] = failureRate > batch.failureThreshold ? 'paused' : downloaded >= target ? 'completed' : 'running';
-      return { ...batch, downloaded, failed, progress: target ? Math.round(downloaded / target * 100) : 0, status, updatedAt: new Date().toISOString() };
-    });
-    const overflow = batches.some((batch, index) => batch.status === 'paused' && state.batches[index]?.status === 'running');
-    return { ...state, batches, audits: overflow ? audit(state, '系统', '失败率超过阈值，已自动暂停发布') : state.audits };
+    const before = state;
+    const ticked = simulateTick(state);
+    const guarded = applyFailureGuard(ticked, before);
+    persist(guarded);
+    return guarded;
   })
 );

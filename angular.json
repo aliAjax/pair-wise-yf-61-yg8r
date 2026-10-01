@@ -16,7 +16,8 @@
             "tsConfig": "tsconfig.app.json",
             "assets": ["src/assets"],
             "styles": ["src/styles.css"],
-            "outputPath": "dist/firmware-release-console"
+            "outputPath": "dist/firmware-release-console",
+            "optimization": { "fonts": false }
           },
           "configurations": {
             "production": {
